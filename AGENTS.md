@@ -16,10 +16,10 @@ RealEmail 是一个用 Rust 写的极简邮件服务端：SMTP 负责收信，PO
 
 1. **代码注释一律使用中文**。包括模块级 `//!`、函数/字段的 `///`、行内 `//`。
 2. **提交信息使用中文，且不使用约定式提交（Conventional Commits）**。
-   - 不要写 `feat:` `fix:` `chore:` `refactor:` 之类的前缀。
-   - 正确示例：`搭建 POP3 与 SMTP 服务端`
-   - 正确示例：`修复 POP3 删除邮件后编号错乱的问题`
-   - 错误示例：`feat: add pop3 server`
+    - 不要写 `feat:` `fix:` `chore:` `refactor:` 之类的前缀。
+    - 正确示例：`搭建 POP3 与 SMTP 服务端`
+    - 正确示例：`修复 POP3 删除邮件后编号错乱的问题`
+    - 错误示例：`feat: add pop3 server`
 3. 协议回包（`+OK`、`-ERR`、`250` 等）必须保持英文 ASCII，方便各类邮件客户端解析；
    日志、报错信息、注释使用中文。
 4. `accounts.toml` 与 `mail.key` 属于敏感文件，不提交到仓库。
@@ -27,6 +27,9 @@ RealEmail 是一个用 Rust 写的极简邮件服务端：SMTP 负责收信，PO
 ## 常用命令
 
 ```powershell
+make build                     # musl 静态链接构建
+make check                     # cargo check --all-targets
+make clean                     # 清理构建产物
 cargo build --release          # 构建
 cargo test                     # 单元测试
 python tools/e2e_test.py       # 端到端测试（自动起停服务）
