@@ -129,7 +129,9 @@ async fn handle(ctx: Arc<Pop3Ctx>, stream: TcpStream) -> Result<()> {
                     conn.write_line("-ERR [AUTH] send USER first").await?;
                     continue;
                 };
-                let name = name.to_ascii_lowercase();
+                // 很多邮件客户端会把完整邮箱填进 USER，这里和 SMTP 一样：
+                // 只比对 `@` 前的账户名，域名不参与判断。
+                let name = account_name(&name);
                 let ok = ctx.accounts.verify(&name, arg);
                 if !ok {
                     // 认证失败时稍作延迟，降低暴力猜测速度。
@@ -421,9 +423,27 @@ fn crlf_lines(data: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
+/// 从 USER 参数里取出账户名：客户端填完整邮箱时只保留 `@` 前的部分。
+fn account_name(user: &str) -> String {
+    let user = user.trim();
+    let local = match user.rsplit_once('@') {
+        Some((local, _domain)) => local,
+        None => user,
+    };
+    local.to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 客户端可能发账户名，也可能发完整邮箱，都要能収ニ成账户名。
+    #[test]
+    fn user_name_normalization() {
+        assert_eq!(account_name("pzw"), "pzw");
+        assert_eq!(account_name("pzw@catilgrass.cn"), "pzw");
+        assert_eq!(account_name(" PZW@Catilgrass.cn "), "pzw");
+    }
 
     // 行首的点必须被重复一次，行中间的点不动。
     #[test]
