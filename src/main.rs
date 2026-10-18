@@ -21,6 +21,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 
 use accounts::Accounts;
 use courier::CourierConfig;
@@ -40,9 +42,11 @@ const DEFAULT_SPAN_MINUTES: u32 = 180;
 /// 物流任务默认轮询间隔（秒）。
 const DEFAULT_POLL_SECONDS: u64 = 60;
 /// 默认的 LLM 接口地址（DeepSeek，OpenAI 兼容协议）。
-const DEFAULT_LLM_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
+/// 只写到根地址即可，末尾的 `/chat/completions` 由代码补齐，
+/// 和 `https://api.deepseek.com/v1` 两种写法都能用。
+const DEFAULT_LLM_ENDPOINT: &str = "https://api.deepseek.com/";
 /// 默认的 LLM 模型。
-const DEFAULT_LLM_MODEL: &str = "deepseek-chat";
+const DEFAULT_LLM_MODEL: &str = "deepseek-flash";
 
 /// 命令行参数。
 #[derive(Parser, Debug)]
@@ -95,7 +99,7 @@ enum Command {
         /// 物流任务轮询间隔（秒）。
         #[arg(long = "courier-interval-seconds", default_value_t = DEFAULT_POLL_SECONDS)]
         courier_interval_seconds: u64,
-        /// LLM 接口地址，兼容 OpenAI 的 chat/completions 协议。
+        /// LLM 接口地址，兼容 OpenAI 的 chat/completions 协议；填根地址或带 version 的地址均可。
         #[arg(long = "llm-endpoint", default_value = DEFAULT_LLM_ENDPOINT)]
         llm_endpoint: String,
         /// LLM 模型名。
@@ -153,6 +157,20 @@ async fn main() -> Result<()> {
 
     let command = cli.command.unwrap_or_else(default_serve);
 
+    // 所有子命令都响应 Ctrl+C，统一在最外层等待中断信号。
+    tokio::select! {
+        result = dispatch(command, accounts_path, key_path, data_dir) => result,
+        _ = shutdown_signal() => Ok(()),
+    }
+}
+
+/// 执行选定的子命令。
+async fn dispatch(
+    command: Command,
+    accounts_path: PathBuf,
+    key_path: PathBuf,
+    data_dir: PathBuf,
+) -> Result<()> {
     match command {
         Command::Serve {
             host,
@@ -233,6 +251,55 @@ async fn main() -> Result<()> {
     }
 }
 
+/// 等待 Ctrl+C：第一次按下后返回给调用方收尾，之后再按一次直接强制退出。
+///
+/// 用 signal 流而不是反复调 `ctrl_c()`：后者复用同一个全局信号状态，
+/// 第一次按键后监听就失效了。
+///
+/// Windows 控制台把 Ctrl+C 当成输入事件处理，命令行工具普遍没有“第二次强制退出”的
+/// 语义，这里只保留第一次。
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(sig) => sig,
+        Err(err) => {
+            eprintln!("无法监听中断信号: {err}");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    if sigint.recv().await.is_none() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    // 后台继续盯着同一个信号流：收尾卡住时用户再按一次就能立刻退出。
+    println!("收到中断信号，正在退出（再按一次 Ctrl+C 可强制退出）");
+    tokio::spawn(async move {
+        if sigint.recv().await.is_some() {
+            eprintln!("强制退出");
+            std::process::exit(130);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// 把用户给的接口地址补齐成 chat/completions 完整地址。
+///
+/// 兼容三种写法：根地址（`https://api.deepseek.com/`）、带 version
+/// （`https://api.deepseek.com/v1`）、已经写全的完整地址。
+fn chat_endpoint(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
 /// 不带子命令时默认执行 serve。
 fn default_serve() -> Command {
     Command::Serve {
@@ -302,7 +369,7 @@ async fn serve(options: ServeOptions) -> Result<()> {
         domain: domain.clone(),
         span_minutes: courier_span_minutes,
         interval: std::time::Duration::from_secs(courier_interval_seconds.max(1)),
-        endpoint: llm_endpoint.clone(),
+        endpoint: chat_endpoint(&llm_endpoint),
         model: llm_model.clone(),
         store: store.clone(),
     });
@@ -345,10 +412,6 @@ async fn serve(options: ServeOptions) -> Result<()> {
     tokio::select! {
         result = smtp::run(smtp_listener, smtp_ctx) => result,
         result = pop3::run(pop3_listener, pop3_ctx) => result,
-        _ = tokio::signal::ctrl_c() => {
-            println!("收到中断信号，正在退出");
-            Ok(())
-        }
     }
 }
 
@@ -396,4 +459,20 @@ fn prompt_password(from_args: Option<String>) -> Result<String> {
         bail!("两次输入的密码不一致");
     }
     Ok(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 根地址、带 version 地址和完整地址都应得到同一个接口地址。
+    #[test]
+    fn chat_endpoint_normalizes() {
+        let full = "https://api.deepseek.com/chat/completions";
+        assert_eq!(chat_endpoint("https://api.deepseek.com/"), full);
+        assert_eq!(chat_endpoint("https://api.deepseek.com"), full);
+        assert_eq!(chat_endpoint("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(chat_endpoint(full), full);
+    }
 }

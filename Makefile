@@ -16,6 +16,7 @@ ifneq (,$(findstring musl,$(TARGET)))
 CC_ENV := $(CC_VAR)="$(MUSL_CC)"
 endif
 
+# 目标名与目录同名时只有同时声明 .PHONY 才能不被当成已存在的文件。
 .PHONY: build clean check
 
 # 静态链接构建（release 配置），产物复制到 build/
@@ -35,3 +36,7 @@ endif
 clean:
 	cargo clean
 	rm -rf $(DIST)
+
+# 快速编译检查，覆盖库、二进制与测试目标
+check:
+	cargo check --all-targets

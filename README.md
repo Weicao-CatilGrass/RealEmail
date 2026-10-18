@@ -143,10 +143,10 @@ POP3 监听: 0.0.0.0:3628
 - 相关参数：
 
 ```powershell
-realemail serve --courier-span-minutes 180   # 模拟总时长（交给 LLM 的“总时长”）
+realemail serve --courier-span-minutes 180    # 模拟总时长（交给 LLM 的“总时长”）
 realemail serve --courier-interval-seconds 60 # 轮询间隔
-realemail serve --llm-endpoint https://api.deepseek.com/chat/completions
-realemail serve --llm-model deepseek-chat
+realemail serve --llm-endpoint https://api.deepseek.com/  # 默认值，可填根地址、/v1 或完整地址
+realemail serve --llm-model deepseek-flash               # 默认值
 ```
 
 ## system 账户：用邮件执行命令
