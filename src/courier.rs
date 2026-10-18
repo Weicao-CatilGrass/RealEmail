@@ -30,7 +30,7 @@ use crate::mailstore::MailStore;
 const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹模拟器”。请根据用户提供的任务变量，模拟一封信从起点到终点的完整物流信息，并只输出 JSONL。
 
 【任务变量】
-当前时间（UTC）：{{当前时间}}
+揽收时间（UTC）：{{当前时间}}
 起点：{{起点}}
 终点：{{终点}}
 寄件人：{{寄件人}}
@@ -38,6 +38,13 @@ const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹�
 总时长：{{总时长}}
 特殊要求：{{特殊要求}}
 信件摘要：{{信件摘要}}
+
+【时间要求】
+1. “offset-minutes”是相对揽收时间的分钟数，第一条如果是揽收，必须大于 0，
+   至少留出 5-10 分钟给上门取件，不能出现 0。
+2. 相邻两条之间要有合理间隔：同城环节 10-60 分钟，分拨与中转 1-6 小时，
+   跨城干线运输 6-24 小时。不要出现几十条都挤在十几分钟里的情况。
+3. 最后一条的 offset-minutes 不得超出总时长。
 
 【路线要求】
 1. 起点与终点都是现实中的地点，请按两地实际地理距离规划路线：跨省需经过真实的分拨中心、
@@ -60,8 +67,8 @@ const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹�
 2. 不要输出数组、Markdown 表格、解释文字、标题或空行。
 3. 每行 JSON 只能包含以下四个字段，字段名必须完全一致：
    {"date":"", "courier-name":"", "message":"", "offset-minutes":0}
-4. “offset-minutes”是相对揽收时刻的分钟数，必须是递增的非负整数，第一条为 0，
-   最后一条不得超前总时长。“date”字段留空字符串即可，服务端会自行换算成真实时间。
+4. “offset-minutes”是相对揽收时间的分钟数，必须是递增的非负整数，最后一条不得超前总时长。
+   “date”字段留空字符串即可，服务端会自行换算成真实时间。
 5. “负责人的英文”使用随机英文人名，可重复但不要连续大量重复。
 6. “做什么事情”必须使用物流、快递、分拣、安检、中转、派送、签收等官方术语。
 7. 允许加入搞怪异常事件，但必须同时包含异常登记、人工复核、路线纠偏或异常处理等官方流程描述。
@@ -87,6 +94,8 @@ pub struct CourierConfig {
     pub span_minutes: u32,
     /// 轮询间隔，默认 60 秒。
     pub interval: Duration,
+    /// 第一条轨迹至少推迟的分钟数，避免发信后立刻收到。
+    pub lead_minutes: u32,
     /// LLM 接口地址。
     pub endpoint: String,
     /// LLM 模型名。
@@ -272,10 +281,25 @@ async fn generate(
         return Ok(());
     };
 
-    // 以生成时刻作为揽收基准，模型只给偏移量，作息由服务端掌控。
-    let base_time = chrono::Utc::now().naive_utc();
+    // 揽收基准用邮件创建时刻，而不是当前时刻：
+    // 生成要等下一轮轮询，若用当前时刻做基准，第一条会立刻到期、瞬间秒发。
+    let base_time = chrono::DateTime::from_timestamp(meta.created_at, 0)
+        .map(|time| time.naive_utc())
+        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
     let prompt = build_prompt(meta, base_time);
-    match request_trace(cfg, &key, &prompt, base_time, meta.span_minutes).await {
+    // 生成时刻单独传入，用于修正“生成耗时把首条拖到已过期”的情况。
+    let now = chrono::Utc::now().naive_utc();
+    match request_trace(
+        cfg,
+        &key,
+        &prompt,
+        base_time,
+        now,
+        meta.span_minutes,
+        cfg.lead_minutes,
+    )
+    .await
+    {
         Ok(entries) if !entries.is_empty() => {
             let mut content = String::new();
             for entry in &entries {
@@ -337,6 +361,9 @@ async fn dispatch(
                 deliver_update(cfg, meta, entry, meta.sent + 1, entries.len()).await;
                 meta.sent += 1;
                 changed = true;
+                // 每轮最多发一条：即使服务停摆了一阵，恢复后也不会把积压的
+                // 十几条物流通知一次性全发出去，保持“陆续到达”的节奏。
+                break;
             }
             // 还没到时间，后面的条目更晚，直接等下一轮。
             _ => break,
@@ -448,13 +475,16 @@ fn encode_header(value: &str) -> String {
 
 /// 调用 LLM 并解析返回的 JSONL。
 ///
-/// `base_time` 是揽收时刻，用来把模型给出的 `offset-minutes` 换算成真实时间。
+/// `base_time` 是揽收时刻，`now` 是生成时刻，用于把 `offset-minutes`
+/// 换算成真实时间，并在生成耗时导致首条过期时整体顺延。
 async fn request_trace(
     cfg: &CourierConfig,
     key: &str,
     prompt: &str,
     base_time: NaiveDateTime,
+    now: NaiveDateTime,
     span_minutes: u32,
+    lead_minutes: u32,
 ) -> Result<Vec<TraceEntry>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -490,7 +520,7 @@ async fn request_trace(
         .and_then(|item| item.get("content"))
         .and_then(|item| item.as_str())
         .unwrap_or_default();
-    let entries = parse_trace(content, base_time, span_minutes);
+    let entries = parse_trace_from(content, base_time, span_minutes, now, lead_minutes);
     if !entries.is_empty() {
         return Ok(entries);
     }
@@ -501,20 +531,41 @@ async fn request_trace(
         .and_then(|item| item.get("reasoning_content"))
         .and_then(|item| item.as_str())
         .unwrap_or_default();
-    let entries = parse_trace(reasoning, base_time, span_minutes);
+    let entries = parse_trace_from(reasoning, base_time, span_minutes, now, lead_minutes);
     if entries.is_empty() {
         bail!("LLM 返回里没有可用的轨迹行（content 为空或无法解析）");
     }
     Ok(entries)
 }
 
+/// 首条轨迹至少推迟的分钟数：留出揽收与装车时间，避免刚投递就秒收。
+const FIRST_OFFSET_MINUTES: u32 = 15;
+/// 相邻轨迹的最小间隔（分钟），防止模型把几十条挤出在同一瞬间。
+const MIN_GAP_MINUTES: u32 = 5;
+
 /// 逐行解析 LLM 返回的 JSONL，按基准时间把偏移量换算成真实时间。
 ///
 /// `base` 是揽收时刻（UTC），模型只负责给出相对分钟数，不负责写日期，
 /// 这样不会因为模型自己编年份而生成过期轨迹。
 /// `span_minutes` 是总时长，超出范围的条目会被丢弃。
+/// 测试用包装：生成时刻与基准时间相同，不触发顺延修正。
+#[cfg(test)]
 fn parse_trace(content: &str, base: NaiveDateTime, span_minutes: u32) -> Vec<TraceEntry> {
+    parse_trace_from(content, base, span_minutes, base, FIRST_OFFSET_MINUTES)
+}
+
+/// `now` 用于修正“生成耗时导致首条已过期”的情况：
+/// 首条必须晚于 `now + lead_minutes`，否则整条时间线顺延。
+fn parse_trace_from(
+    content: &str,
+    base: NaiveDateTime,
+    span_minutes: u32,
+    now: NaiveDateTime,
+    lead_minutes: u32,
+) -> Vec<TraceEntry> {
     let mut entries: Vec<TraceEntry> = Vec::new();
+    let mut times: Vec<NaiveDateTime> = Vec::new();
+    let mut last_offset: Option<u32> = None;
     for line in content.lines() {
         let line = line.trim();
         let line = line.strip_prefix("```json").unwrap_or(line);
@@ -530,32 +581,47 @@ fn parse_trace(content: &str, base: NaiveDateTime, span_minutes: u32) -> Vec<Tra
         }
 
         // 优先用 offset-minutes；兼容旧格式里直接给了合法 date 的情况。
-        let date = match entry.offset_minutes {
-            Some(minutes) if minutes <= span_minutes => {
-                base + chrono::Duration::minutes(i64::from(minutes))
-            }
-            Some(_) => continue,
+        let offset = match entry.offset_minutes {
+            Some(minutes) => minutes,
             None => match NaiveDateTime::parse_from_str(&entry.date, "%Y-%m-%d %H:%M") {
-                Ok(parsed) => parsed,
+                Ok(parsed) => {
+                    let diff = parsed.signed_duration_since(base).num_minutes();
+                    diff.clamp(0, i64::from(span_minutes)) as u32
+                }
                 Err(_) => continue,
             },
         };
 
-        // 时间必须严格递增。
-        if let Some(last) = entries.last() {
-            let Ok(last_at) = NaiveDateTime::parse_from_str(&last.date, "%Y-%m-%d %H:%M") else {
-                continue;
-            };
-            if date <= last_at {
-                continue;
-            }
+        // 服务端强制最小间隔：模型挤在一起时也不至于连续秒发。
+        let offset = match last_offset {
+            None => offset.max(FIRST_OFFSET_MINUTES),
+            Some(previous) => offset.max(previous.saturating_add(MIN_GAP_MINUTES)),
+        };
+        if offset > span_minutes {
+            continue;
         }
 
+        let date = base + chrono::Duration::minutes(i64::from(offset));
         entry.date = date.format("%Y-%m-%d %H:%M").to_string();
-        // 偏移量只在生成阶段使用，写入文件后保持三个字段的既定格式。
+        // 偏移量只在生成阶段使用，写入文件后保持既有字段格式。
         entry.offset_minutes = None;
+        times.push(date);
+        last_offset = Some(offset);
         entries.push(entry);
     }
+
+    // 生成耗时（轮询等待 + LLM 推理）可能把首条拖到已过期，
+    // 此时整条时间线顺延，保证用户至少等 lead_minutes 才收到第一条。
+    if let Some(&first) = times.first() {
+        let earliest = now + chrono::Duration::minutes(i64::from(lead_minutes.max(1)));
+        if first < earliest {
+            let shift = earliest - first;
+            for (entry, at) in entries.iter_mut().zip(times.iter()) {
+                entry.date = (*at + shift).format("%Y-%m-%d %H:%M").to_string();
+            }
+        }
+    }
+
     entries
 }
 
@@ -736,8 +802,8 @@ mod tests {
         assert!(prompt.contains("起点：北京市朝阳区"));
         assert!(prompt.contains("总时长：90 分钟"));
         assert!(prompt.contains("信件摘要：（无正文）"));
-        // 当前时间必须真的填进去，而不是留给模型自己编。
-        assert!(prompt.contains("当前时间（UTC）：2026-10-18 09:30"));
+        // 揽收时间必须真的填进去，而不是留给模型自己编。
+        assert!(prompt.contains("揽收时间（UTC）：2026-10-18 09:30"));
     }
 
     // 信件正文要压掉换行并限制长度，且不能把正文里的占位符当成模板变量。
@@ -774,7 +840,7 @@ mod tests {
         assert_eq!(summarize_letter("  "), "");
     }
 
-    // 非法行、时间倒流的行都要被过滤，偏移量要换算成真实时间。
+    // 非法行会被过滤；合法但时间倒流的行按服务端最小间隔重新排序。
     #[test]
     fn trace_parsing() {
         let content = r#"{"date":"2025-01-01 10:00","courier-name":"Tom","message":"揽收"}
@@ -783,9 +849,13 @@ not json
 {"date":"2025-01-01 11:00","courier-name":"Jack","message":"签收"}
 ```"#;
         let entries = parse_trace(content, test_now(), 180);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].courier_name, "Tom");
-        assert_eq!(entries[1].message, "签收");
+        assert_eq!(entries[2].message, "签收");
+        // 首条不早于 FIRST_OFFSET_MINUTES，之后逐条拉开最小间隔。
+        assert_eq!(entries[0].date, "2026-10-18 09:45");
+        assert_eq!(entries[1].date, "2026-10-18 09:50");
+        assert_eq!(entries[2].date, "2026-10-18 09:55");
     }
 
     // 模型只给 offset-minutes 时，时间应当由服务端按基准时间换算。
@@ -797,23 +867,40 @@ not json
 {"courier-name":"Evil","message":"超出总时长","offset-minutes":999}"#;
         let entries = parse_trace(content, test_now(), 180);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].date, "2026-10-18 09:30");
+        // offset 0 会被抬到首条最小偏移，不会立刻到期。
+        assert_eq!(entries[0].date, "2026-10-18 09:45");
         assert_eq!(entries[1].date, "2026-10-18 10:15");
         assert_eq!(entries[2].date, "2026-10-18 12:00");
         // 偏移量属于生成期的中间字段，写入轨迹文件后应当不出现。
         assert!(entries.iter().all(|entry| entry.offset_minutes.is_none()));
     }
 
-    // 偏移量不递增或模型自编日期时，不能污染结果。
+    // 偏移量挤在一起时，服务端强制拉开间隔。
     #[test]
     fn trace_rejects_bad_offsets() {
         let content = r#"{"courier-name":"A","message":"一","offset-minutes":10}
 {"courier-name":"B","message":"二","offset-minutes":5}
 {"courier-name":"C","message":"三","offset-minutes":20}"#;
         let entries = parse_trace(content, test_now(), 180);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].date, "2026-10-18 09:40");
+        assert_eq!(entries.len(), 3);
+        // 首条被抬到 FIRST_OFFSET_MINUTES，后续依次 +MIN_GAP_MINUTES。
+        assert_eq!(entries[0].date, "2026-10-18 09:45");
         assert_eq!(entries[1].date, "2026-10-18 09:50");
+        assert_eq!(entries[2].date, "2026-10-18 09:55");
+    }
+
+    // 生成耗时把首条拖到已过期时，整条时间线顺延，不能出现秒收。
+    #[test]
+    fn trace_shifts_when_stale() {
+        let content = r#"{"courier-name":"A","message":"揽收","offset-minutes":15}
+{"courier-name":"B","message":"分拨","offset-minutes":75}"#;
+        // 邮件 09:30 创建，但生成时已经 10:00（轮询 + LLM 耗时）。
+        let now = NaiveDateTime::parse_from_str("2026-10-18 10:00", "%Y-%m-%d %H:%M").unwrap();
+        let entries = parse_trace_from(content, test_now(), 180, now, 15);
+        assert_eq!(entries.len(), 2);
+        // 首条至少晚于 now + 15 分钟，并保持原有间隔（60 分钟）。
+        assert_eq!(entries[0].date, "2026-10-18 10:15");
+        assert_eq!(entries[1].date, "2026-10-18 11:15");
     }
 
     // 个人资料里的地址行优先，其次才是短句。

@@ -45,11 +45,13 @@ PASSWORDS = {
     "system": "system-pass",
 }
 
-# 模拟 LLM 返回的三条轨迹，时间都取自过去，保证轮询时立刻到期。
+# 模拟 LLM 返回的三条轨迹，用相对揽收时刻的 offset-minutes。
+# 服务端会强制首条不早于 lead-minutes、相邻至少 5 分钟；
+# 测试里把轮询间隔和首条延迟都调小（各 1 分钟），以便很快拿到结果。
 MOCK_TRACE = [
-    {"courier-name": "Michael Smith", "message": "快件已揽收，运单号 SF1234567890", "minutes_ago": 30},
-    {"courier-name": "Anna Brown", "message": "到达上海转运中心，进入分拣环节", "minutes_ago": 20},
-    {"courier-name": "Tom Wilson", "message": "已签收，签收凭证已上传，追踪码关闭", "minutes_ago": 10},
+    {"courier-name": "Michael Smith", "message": "快件已揽收，运单号 SF1234567890", "offset": 1},
+    {"courier-name": "Anna Brown", "message": "到达上海转运中心，进入分拣环节", "offset": 6},
+    {"courier-name": "Tom Wilson", "message": "已签收，签收凭证已上传，追踪码关闭", "offset": 11},
 ]
 
 
@@ -71,16 +73,15 @@ class MockLLM(BaseHTTPRequestHandler):
         except (KeyError, IndexError, json.JSONDecodeError):
             MockLLM.prompt = ""
 
-        now = datetime.now(timezone.utc)
         lines = []
         for item in MOCK_TRACE:
-            stamp = (now - timedelta(minutes=item["minutes_ago"])).strftime("%Y-%m-%d %H:%M")
             lines.append(
                 json.dumps(
                     {
-                        "date": stamp,
+                        "date": "",
                         "courier-name": item["courier-name"],
                         "message": item["message"],
+                        "offset-minutes": item["offset"],
                     },
                     ensure_ascii=False,
                 )
@@ -177,6 +178,8 @@ def start_server(llm_port: int) -> subprocess.Popen:
             "--domain",
             DOMAIN,
             "--courier-interval-seconds",
+            "1",
+            "--courier-lead-minutes",
             "1",
             "--courier-span-minutes",
             "60",
@@ -396,8 +399,10 @@ def test_courier() -> None:
     send_mail("alice", "bob", "物流测试", letter)
 
     # bob：原始邮件 1 封 + 3 条物流通知；alice：3 条物流通知。
-    wait_mail_count("bob", 4)
-    wait_mail_count("alice", 3)
+    # 服务端强制相邻轨迹至少 5 分钟，三条要等 10 分钟出头。
+    print("等待物流轨迹按节奏投递（约 12 分钟）...")
+    wait_mail_count("bob", 4, timeout=900)
+    wait_mail_count("alice", 3, timeout=900)
 
     if MockLLM.auth != "Bearer test-key":
         fail(f"LLM 请求缺少正确的 Authorization：{MockLLM.auth!r}")

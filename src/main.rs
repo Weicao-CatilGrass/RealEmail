@@ -41,6 +41,8 @@ const DEFAULT_MAX_MESSAGE_MB: u64 = 25;
 const DEFAULT_SPAN_MINUTES: u32 = 180;
 /// 物流任务默认轮询间隔（秒）。
 const DEFAULT_POLL_SECONDS: u64 = 60;
+/// 第一条物流轨迹默认至少推迟的分钟数。
+const DEFAULT_LEAD_MINUTES: u32 = 15;
 /// 默认的 LLM 接口地址（DeepSeek，OpenAI 兼容协议）。
 /// 只写到根地址即可，末尾的 `/chat/completions` 由代码补齐，
 /// 和 `https://api.deepseek.com/v1` 两种写法都能用。
@@ -99,6 +101,9 @@ enum Command {
         /// 物流任务轮询间隔（秒）。
         #[arg(long = "courier-interval-seconds", default_value_t = DEFAULT_POLL_SECONDS)]
         courier_interval_seconds: u64,
+        /// 第一条物流轨迹至少推迟多少分钟，避免发信后立刻收到。
+        #[arg(long = "courier-lead-minutes", default_value_t = DEFAULT_LEAD_MINUTES)]
+        courier_lead_minutes: u32,
         /// LLM 接口地址，兼容 OpenAI 的 chat/completions 协议；填根地址或带 version 的地址均可。
         #[arg(long = "llm-endpoint", default_value = DEFAULT_LLM_ENDPOINT)]
         llm_endpoint: String,
@@ -180,6 +185,7 @@ async fn dispatch(
             max_message_mb,
             courier_span_minutes,
             courier_interval_seconds,
+            courier_lead_minutes,
             llm_endpoint,
             llm_model,
         } => {
@@ -194,6 +200,7 @@ async fn dispatch(
                 max_message_mb,
                 courier_span_minutes,
                 courier_interval_seconds,
+                courier_lead_minutes,
                 llm_endpoint,
                 llm_model,
             })
@@ -310,6 +317,7 @@ fn default_serve() -> Command {
         max_message_mb: DEFAULT_MAX_MESSAGE_MB,
         courier_span_minutes: DEFAULT_SPAN_MINUTES,
         courier_interval_seconds: DEFAULT_POLL_SECONDS,
+        courier_lead_minutes: DEFAULT_LEAD_MINUTES,
         llm_endpoint: DEFAULT_LLM_ENDPOINT.to_string(),
         llm_model: DEFAULT_LLM_MODEL.to_string(),
     }
@@ -327,6 +335,7 @@ struct ServeOptions {
     max_message_mb: u64,
     courier_span_minutes: u32,
     courier_interval_seconds: u64,
+    courier_lead_minutes: u32,
     llm_endpoint: String,
     llm_model: String,
 }
@@ -344,6 +353,7 @@ async fn serve(options: ServeOptions) -> Result<()> {
         max_message_mb,
         courier_span_minutes,
         courier_interval_seconds,
+        courier_lead_minutes,
         llm_endpoint,
         llm_model,
     } = options;
@@ -369,6 +379,7 @@ async fn serve(options: ServeOptions) -> Result<()> {
         domain: domain.clone(),
         span_minutes: courier_span_minutes,
         interval: std::time::Duration::from_secs(courier_interval_seconds.max(1)),
+        lead_minutes: courier_lead_minutes,
         endpoint: chat_endpoint(&llm_endpoint),
         model: llm_model.clone(),
         store: store.clone(),
