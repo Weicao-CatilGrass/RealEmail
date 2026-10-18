@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::NaiveDateTime;
@@ -431,7 +431,9 @@ async fn request_trace(cfg: &CourierConfig, key: &str, prompt: &str) -> Result<V
         "model": cfg.model,
         "messages": [{ "role": "user", "content": prompt }],
         "temperature": 1.0,
-        "max_tokens": 2000,
+        // deepseek-flash 默认开启思考，思考与正式回答共用输出额度，
+        // 额度太小会把 JSONL 截断，这里留足空间。
+        "max_tokens": 8192,
         "stream": false,
     });
 
@@ -450,11 +452,27 @@ async fn request_trace(cfg: &CourierConfig, key: &str, prompt: &str) -> Result<V
 
     let value: serde_json::Value =
         serde_json::from_str(&text).context("LLM 返回的不是合法 JSON")?;
-    let content = value
-        .pointer("/choices/0/message/content")
+    let message = value.pointer("/choices/0/message");
+    let content = message
+        .and_then(|item| item.get("content"))
         .and_then(|item| item.as_str())
-        .ok_or_else(|| anyhow!("LLM 返回缺少 choices[0].message.content"))?;
-    Ok(parse_trace(content))
+        .unwrap_or_default();
+    let entries = parse_trace(content);
+    if !entries.is_empty() {
+        return Ok(entries);
+    }
+
+    // 开启思考的模型（如 deepseek-flash 默认行为）如果额度耗尽，
+    // content 会是空的，此时从 reasoning_content 里找 JSONL 兑底。
+    let reasoning = message
+        .and_then(|item| item.get("reasoning_content"))
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let entries = parse_trace(reasoning);
+    if entries.is_empty() {
+        bail!("LLM 返回里没有可用的轨迹行（content 为空或无法解析）");
+    }
+    Ok(entries)
 }
 
 /// 逐行解析 LLM 返回的 JSONL，过滤不合法或时间不递增的行。

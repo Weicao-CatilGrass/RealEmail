@@ -7,3 +7,5 @@
 /mail.key
 /data/
 *.tmp
+
+__*
