@@ -22,9 +22,9 @@ realemail serve --smtp-port 3628 --pop3-port 3629   # 想对调也行
 ## 构建
 
 ```bash
-make build    # musl 静态链接，产物：target/x86_64-unknown-linux-musl/release/realemail
+make build    # musl 静态链接，产物：build/realemail
 make check    # cargo check --all-targets
-make clean    # cargo clean
+make clean    # cargo clean + 删除 build/
 ```
 
 也可以直接用 cargo 构建（不指定 musl 目标时产物在 `target\release\realemail.exe`）：

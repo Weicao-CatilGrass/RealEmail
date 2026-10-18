@@ -1,5 +1,6 @@
 # 构建产物
 /target/
+/build/
 
 # 运行时数据与敏感文件
 /accounts.toml
