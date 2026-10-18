@@ -1,0 +1,24 @@
+[package]
+name = "realemail"
+version = "0.1.0"
+edition = "2021"
+description = "极简 POP3 + SMTP 本地邮件服务端"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+aes-gcm = "0.10"
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+encoding_rs = "0.8"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "signal"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

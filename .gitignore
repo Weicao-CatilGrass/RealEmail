@@ -1,0 +1,8 @@
+# 构建产物
+/target/
+
+# 运行时数据与敏感文件
+/accounts.toml
+/mail.key
+/data/
+*.tmp
