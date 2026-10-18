@@ -3,7 +3,7 @@ name = "realemail"
 version = "0.1.0"
 edition = "2021"
 description = "极简 POP3 + SMTP 本地邮件服务端"
-license = "MIT"
+license = "WTFPL"
 
 [dependencies]
 anyhow = "1"
