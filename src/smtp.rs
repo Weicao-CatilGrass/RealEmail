@@ -234,9 +234,14 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                     continue;
                 };
 
-                // 内部转发：把同一封邮件投递到所有本地收件人。
+                // 内部转发：system 是命令入口，立即投递；普通收件人的邮件先进入
+                // 物流任务暂存，等签收后才落到收件人邮箱。
                 let mut delivered = 0usize;
                 for recipient in &recipients {
+                    if recipient != SYSTEM_ACCOUNT {
+                        delivered += 1;
+                        continue;
+                    }
                     match ctx.store.deliver(recipient, &full).await {
                         Ok(uid) => {
                             delivered += 1;
@@ -279,6 +284,7 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                         recipient,
                         &subject,
                         &body,
+                        &full,
                     )
                     .await
                     {

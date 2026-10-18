@@ -31,13 +31,22 @@ const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹�
 
 【任务变量】
 揽收时间（UTC）：{{当前时间}}
-起点：{{起点}}
-终点：{{终点}}
+起点（寄出地）：{{起点}}
+终点（目的地）：{{终点}}
 寄件人：{{寄件人}}
 收件人：{{收件人}}
 总时长：{{总时长}}
 特殊要求：{{特殊要求}}
 信件摘要：{{信件摘要}}
+
+【方向要求】
+1. 方向必须是「{{起点}} → {{终点}}」，货物从起点出发，向终点移动，不得反向。
+2. 每一条 message 里提到的地名，必须是当前所处或即将前往的位置，
+   例如起点城市 → 中转城市 → 终点城市，不得在新疆中转后再写回起点。
+3. 第一条只能在起点城市内行动（上门揽收、起点营业点、起点市内分拨）。
+4. 最后一条必须在终点城市内（终点营业点、派送、签收）。
+5. 如果需要绕路或错分，写清“从 A 发往 B 途中错分到 C，再纠偏回 B”，
+   不要让读者分不清货物到底在哪。
 
 【时间要求】
 1. “offset-minutes”是相对揽收时间的分钟数，第一条如果是揽收，必须大于 0，
@@ -49,8 +58,9 @@ const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹�
 【路线要求】
 1. 起点与终点都是现实中的地点，请按两地实际地理距离规划路线：跨省需经过真实的分拨中心、
    集散中心或航空口岸，同城直接进入区域分拨与派送。
-2. 各环节耗时要与距离匹配：同城几小时，省内半天到一天，跨省一到数天，跨国数天到一周。
-3. 你可以自行判断起终点距离量级，不要出现明显不合理的传送。
+2. 中转城市必须在起点与终点之间，顺序不能颠倒。
+3. 各环节耗时要与距离匹配：同城几小时，省内半天到一天，跨省一到数天，跨国数天到一周。
+4. 不要出现明显不合理的传送（比如起点北京、终点上海，却先去广州再回北京）。
 
 【信件影响】
 信件摘要是这封信的实际内容。请自行判断其中是否有影响物流时效与方式的因素，例如：
@@ -157,13 +167,17 @@ pub struct TraceEntry {
     pub offset_minutes: Option<u32>,
 }
 
-/// 创建一条物流任务，供 SMTP 投递成功后调用。
+/// 创建一条物流任务，供 SMTP 收到邮件时调用。
+///
+/// 原件不会立刻投递，而是先落在收件人目录的 `.eml` 里，
+/// 等所有物流轨迹走完、签收后再投递到收件人邮箱。
 pub async fn create_task(
     cfg: &CourierConfig,
     sender: &str,
     recipient: &str,
     subject: &str,
     body: &str,
+    raw: &[u8],
 ) -> Result<()> {
     let now = chrono::Utc::now();
     // 带毫秒，避免同一秒内多封邮件互相覆盖。
@@ -197,7 +211,11 @@ pub async fn create_task(
     tokio::fs::write(dir.join(format!("{base}.json")), b"")
         .await
         .with_context(|| format!("创建轨迹文件失败: {}", base))?;
-    println!("[courier] 已创建物流任务 {base}（{sender} → {recipient}）");
+    // 原件暂存，签收后再投递。
+    tokio::fs::write(dir.join(format!("{base}.eml")), raw)
+        .await
+        .with_context(|| format!("暂存邮件原件失败: {}", base))?;
+    println!("[courier] 已创建物流任务 {base}（{sender} → {recipient}），邮件将在签收后投递");
     Ok(())
 }
 
@@ -257,7 +275,7 @@ async fn process_task(
 
     match meta.status.as_str() {
         "pending" => generate(cfg, &mut meta, meta_path, &json_path, base).await,
-        "ready" => dispatch(cfg, &mut meta, meta_path, &json_path).await,
+        "ready" => dispatch(cfg, &mut meta, meta_path, &json_path, base).await,
         _ => Ok(()),
     }
 }
@@ -332,12 +350,13 @@ async fn generate(
     Ok(())
 }
 
-/// 把已经到期的轨迹条目投递出去。
+/// 把已经到期的轨迹条目投递出去；全部投完后把原件从暂存区投递到收件人邮箱。
 async fn dispatch(
     cfg: &CourierConfig,
     meta: &mut TaskMeta,
     meta_path: &Path,
     json_path: &Path,
+    base: &str,
 ) -> Result<()> {
     let content = tokio::fs::read_to_string(json_path).await?;
     let entries: Vec<TraceEntry> = content
@@ -371,6 +390,8 @@ async fn dispatch(
     }
 
     if meta.sent >= entries.len() {
+        // 签收后才把原件投递到收件人，之前只是一路跟进物流通知。
+        deliver_original(cfg, meta, base).await;
         meta.status = "done".to_string();
         changed = true;
     }
@@ -378,6 +399,29 @@ async fn dispatch(
         save_meta(meta_path, meta).await?;
     }
     Ok(())
+}
+
+/// 把暂存的邮件原件投递到收件人邮箱，投递后删除暂存文件。
+async fn deliver_original(cfg: &CourierConfig, meta: &TaskMeta, base: &str) {
+    let dir = cfg.workspace.join(&meta.recipient);
+    let path = dir.join(format!("{base}.eml"));
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        // 没有暂存文件（旧任务或已投递过）直接跳过。
+        Err(_) => return,
+    };
+    match cfg.store.deliver(&meta.recipient, &raw).await {
+        Ok(uid) => {
+            println!(
+                "[courier] 物流完成，邮件原件已投递到 {}（编号 {uid}）",
+                meta.recipient
+            );
+            if let Err(err) = tokio::fs::remove_file(&path).await {
+                eprintln!("[courier] 删除暂存原件失败: {err}");
+            }
+        }
+        Err(err) => eprintln!("[courier] 投递原件到 {} 失败: {err}", meta.recipient),
+    }
 }
 
 /// 把一条轨迹同时投递到收件人和寄件人的邮箱。
@@ -799,9 +843,11 @@ mod tests {
         };
         let prompt = build_prompt(&meta, test_now());
         assert!(!prompt.contains("{{"));
-        assert!(prompt.contains("起点：北京市朝阳区"));
+        assert!(prompt.contains("起点（寄出地）：北京市朝阳区"));
+        assert!(prompt.contains("终点（目的地）：上海市浦东新区"));
         assert!(prompt.contains("总时长：90 分钟"));
         assert!(prompt.contains("信件摘要：（无正文）"));
+        assert!(prompt.contains("【方向要求】"));
         // 揽收时间必须真的填进去，而不是留给模型自己编。
         assert!(prompt.contains("揽收时间（UTC）：2026-10-18 09:30"));
     }
@@ -827,7 +873,7 @@ mod tests {
         assert!(prompt.contains("奶奶： 药收到了吗？ 记得按时吃"));
         // 正文里的 `{{终点}}` 不得被替换成真实地点。
         assert!(prompt.contains("{ {终点}}"));
-        assert!(prompt.contains("终点：上海市"));
+        assert!(prompt.contains("终点（目的地）：上海市"));
     }
 
     // 超长正文会被截断并补上省略号。
