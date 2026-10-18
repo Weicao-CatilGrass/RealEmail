@@ -75,6 +75,7 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
         .await?;
 
     let mut helo: Option<String> = None;
+    let mut authed: Option<String> = None;
     let mut mail_from: Option<String> = None;
     let mut recipients: Vec<String> = Vec::new();
     let mut counter: u64 = 0;
@@ -111,6 +112,8 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                     .await?;
                 conn.write_line("250-8BITMIME").await?;
                 conn.write_line("250-ENHANCEDSTATUSCODES").await?;
+                // 客户端配了 SMTPAuth 时只会用这里声明的机制发认证。
+                conn.write_line("250-AUTH PLAIN LOGIN").await?;
                 conn.write_line("250 HELP").await?;
             }
             "HELO" => {
@@ -118,6 +121,28 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                 mail_from = None;
                 recipients.clear();
                 conn.write_line(&format!("250 {}", ctx.host)).await?;
+            }
+            "AUTH" => {
+                if helo.is_none() {
+                    conn.write_line("503 5.5.1 Send EHLO first").await?;
+                    continue;
+                }
+                if authed.is_some() {
+                    conn.write_line("503 5.5.1 Already authenticated").await?;
+                    continue;
+                }
+                match smtp_auth(&mut conn, &ctx, arg).await? {
+                    Some(name) => {
+                        authed = Some(name.clone());
+                        println!("[smtp] {name} 认证成功");
+                        conn.write_line("235 2.7.0 Authentication successful").await?;
+                    }
+                    None => {
+                        // 稍作延迟，降低暴力猜测速度。
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        conn.write_line("535 5.7.8 Authentication failed").await?;
+                    }
+                }
             }
             "MAIL" => {
                 if helo.is_none() {
@@ -279,11 +304,11 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
             "VRFY" => {
                 conn.write_line("252 2.5.2 Cannot VRFY user").await?;
             }
-            "EXPN" | "AUTH" | "STARTTLS" => {
+            "EXPN" | "STARTTLS" => {
                 conn.write_line("502 5.5.1 Command not implemented").await?;
             }
             "HELP" => {
-                conn.write_line("214 2.0.0 Commands: EHLO HELO MAIL RCPT DATA RSET NOOP QUIT")
+                conn.write_line("214 2.0.0 Commands: EHLO HELO AUTH MAIL RCPT DATA RSET NOOP QUIT")
                     .await?;
             }
             "QUIT" => {
@@ -407,6 +432,95 @@ fn local_account(address: &str, accounts: &BTreeMap<String, String>) -> Option<S
     let local = local.to_ascii_lowercase();
     if accounts.contains_key(&local) {
         Some(local)
+    } else {
+        None
+    }
+}
+
+/// 处理 `AUTH PLAIN` / `AUTH LOGIN`，成功时返回规范化后的账户名。
+///
+/// 认证只是为了兼容客户端（很多客户端配了 SMTPAuth 就一定要登录），
+/// 服务端仍允许不认证直接发信，是否校验密码交给客户端决定。
+async fn smtp_auth(conn: &mut Conn, ctx: &SmtpCtx, arg: &str) -> Result<Option<String>> {
+    let (mechanism, initial) = split_command(arg);
+    let mechanism = mechanism.to_ascii_uppercase();
+    match mechanism.as_str() {
+        "PLAIN" => {
+            // 支持 `AUTH PLAIN <base64>` 与 `AUTH PLAIN` + 挑战两步。
+            let encoded = if initial.is_empty() {
+                conn.write_line("334 ").await?;
+                read_auth_line(conn).await?
+            } else {
+                Some(initial.to_string())
+            };
+            let Some(encoded) = encoded else {
+                return Ok(None);
+            };
+            let Some(bytes) = decode_base64(&encoded) else {
+                return Ok(None);
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                return Ok(None);
+            };
+            // 格式：authorization-id \0 authentication-id \0 password
+            // 前两段可能合为一个（客户端省掉了 authzid），从右侧取密码更稳。
+            let Some((user, password)) = text.rsplit_once('\0') else {
+                return Ok(None);
+            };
+            // 用户名可能还带着 authzid，取最后一段。
+            let user = user.rsplit('\0').next().unwrap_or_default();
+            Ok(check_login(ctx, user, password))
+        }
+        "LOGIN" => {
+            // LOGIN 依次要用户名、密码，没有初始响应时先发挑战。
+            let user = if initial.is_empty() {
+                conn.write_line("334 VXNlcm5hbWU6").await?;
+                read_auth_line(conn).await?
+            } else {
+                Some(initial.to_string())
+            };
+            conn.write_line("334 UGFzc3dvcmQ6").await?;
+            let password = read_auth_line(conn).await?;
+            let (Some(user), Some(password)) = (user, password) else {
+                return Ok(None);
+            };
+            let (Some(user), Some(password)) = (decode_base64(&user), decode_base64(&password))
+            else {
+                return Ok(None);
+            };
+            let (Ok(user), Ok(password)) = (String::from_utf8(user), String::from_utf8(password))
+            else {
+                return Ok(None);
+            };
+            Ok(check_login(ctx, &user, &password))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// 读取客户端发来的一行 Base64（可能取消认证）。
+async fn read_auth_line(conn: &mut Conn) -> Result<Option<String>> {
+    let Some(raw) = conn.read_line().await? else {
+        return Ok(None);
+    };
+    let line = String::from_utf8_lossy(&raw).trim().to_string();
+    if line == "*" {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+/// 宽松的 Base64 解码，不合法时返回 `None`。
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    STANDARD.decode(input.trim()).ok()
+}
+
+/// 校验账户名（允许带 `@域名`）与密码，返回规范化后的账户名。
+fn check_login(ctx: &SmtpCtx, user: &str, password: &str) -> Option<String> {
+    let name = local_account(user, &ctx.accounts.map)?;
+    if ctx.accounts.verify(&name, password) {
+        Some(name)
     } else {
         None
     }
