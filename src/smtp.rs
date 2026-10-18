@@ -268,6 +268,7 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
 
                 // 为普通收件人创建物流任务（system 是命令入口，不参与模拟）。
                 let subject = commands::subject_of(&full);
+                let body = commands::body_of(&full);
                 for recipient in &recipients {
                     if recipient == SYSTEM_ACCOUNT || delivered == 0 {
                         continue;
@@ -277,6 +278,7 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                         &sender_account,
                         recipient,
                         &subject,
+                        &body,
                     )
                     .await
                     {

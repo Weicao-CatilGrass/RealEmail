@@ -93,13 +93,14 @@ POP3 监听: 0.0.0.0:3628
 
 ## 客户端设置
 
-| 项目               | 值                                         |
-| ------------------ | ------------------------------------------ |
-| 发信服务器（SMTP） | 服务器 IP，端口 3629                       |
-| 收信服务器（POP3） | 服务器 IP，端口 3628                       |
-| 用户名             | 账户名，例如 `alice`（不是完整邮箱）       |
-| 密码               | 该账户的明文密码                           |
-| 加密方式           | 无（不支持 TLS/SSL，请只在内网或本机使用） |
+| 项目               | 值                                                     |
+| ------------------ | ------------------------------------------------------ |
+| 发信服务器（SMTP） | 服务器 IP，端口 3629                                   |
+| 收信服务器（POP3） | 服务器 IP，端口 3628                                   |
+| 用户名             | 账户名，例如 `alice`；SMTP 认证时填完整邮箱也可以      |
+| 密码               | 该账户的明文密码                                       |
+| SMTP 认证          | 可选，支持 `AUTH PLAIN` / `AUTH LOGIN`；不认证也能发信 |
+| 加密方式           | 无（不支持 TLS/SSL，请只在内网或本机使用）             |
 
 收件人地址写成 `bob@任意域名` 都可以，服务器只比较 `@` 前面的账户名。
 **只要本地没有这个账户，一律 550 拒收**，不会向外部服务器投递。
@@ -188,11 +189,12 @@ data/
 
 ## 实现范围
 
-- SMTP：HELO/EHLO、MAIL、RCPT、DATA、RSET、NOOP、VRFY、QUIT、HELP，支持 SIZE / 8BITMIME / PIPELINING 声明；
+- SMTP：HELO/EHLO、AUTH（PLAIN / LOGIN）、MAIL、RCPT、DATA、RSET、NOOP、VRFY、QUIT、HELP，支持 SIZE / 8BITMIME / PIPELINING 声明；
 - POP3：USER/PASS、STAT、LIST、RETR、DELE、NOOP、RSET、TOP、UIDL、CAPA、QUIT；
 - 同一邮箱同一时刻只允许一个 POP3 会话；`DELE` 只在正常 `QUIT` 后生效；
 - 物流任务按分钟轮询，`date` 到点才投递，没到点就一直等；
-- 不支持：TLS、外部域名投递、SMTP 认证、APOP。
+- 不支持：TLS、外部域名投递、APOP。
+- SMTP 认证只做账户密码校验，不强制：未认证的连接同样可以发信。
 
 ## 测试
 

@@ -36,6 +36,12 @@ const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹�
 收件人：{{收件人}}
 总时长：{{总时长}}
 特殊要求：{{特殊要求}}
+信件摘要：{{信件摘要}}
+
+【剧情要求】
+信件摘要是这封信的实际内容。请让轨迹里的异常事件、检查理由、延误原因与信件内容呼应，
+例如信件提到药品就体现冷链与温控，提到食物就体现防压防潮，提到急件就体现加急优先。
+但轨迹本身仍然是物流流水账，不要把信件内容原文写进 message，也不要把它当成小说情节展开。
 
 【输出规则】
 1. 只输出 JSONL，每行一个独立、合法的 JSON 对象。
@@ -54,6 +60,9 @@ const PROMPT_TEMPLATE: &str = r#"你现在是一个“赛博信使物流轨迹�
 
 【开始生成】
 请根据以上变量和规则，直接输出 JSONL，不要输出任何额外说明。"#;
+
+/// 传给 LLM 的信件正文最大字符数。
+const LETTER_LIMIT: usize = 600;
 
 /// 物流任务的运行配置。
 pub struct CourierConfig {
@@ -90,6 +99,9 @@ pub struct TaskMeta {
     pub destination: String,
     /// 特殊要求（沿用邮件主题）。
     pub special: String,
+    /// 信件正文摘要，用于让轨迹与信件内容呼应（旧任务可能没有该字段）。
+    #[serde(default)]
+    pub letter: String,
     /// 任务状态：pending / ready / done / failed。
     pub status: String,
     /// 已投递的轨迹条数。
@@ -119,6 +131,7 @@ pub async fn create_task(
     sender: &str,
     recipient: &str,
     subject: &str,
+    body: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now();
     // 带毫秒，避免同一秒内多封邮件互相覆盖。
@@ -141,6 +154,7 @@ pub async fn create_task(
         } else {
             format!("邮件主题：{subject}")
         },
+        letter: summarize_letter(body),
         status: "pending".to_string(),
         sent: 0,
         total: 0,
@@ -473,8 +487,39 @@ fn parse_trace(content: &str) -> Vec<TraceEntry> {
     entries
 }
 
+/// 把邮件正文压成传给 LLM 的摘要：合并空白并限制长度，避免提示词过长。
+fn summarize_letter(body: &str) -> String {
+    let mut text = String::new();
+    let mut count = 0usize;
+    let mut last_space = false;
+    for ch in body.trim().chars() {
+        if ch.is_whitespace() {
+            // 连续空白（含换行）压成单个空格。
+            if !last_space && !text.is_empty() {
+                text.push(' ');
+                last_space = true;
+            }
+            continue;
+        }
+        if count >= LETTER_LIMIT {
+            text.push('…');
+            break;
+        }
+        text.push(ch);
+        count += 1;
+        last_space = false;
+    }
+    text.trim_end().to_string()
+}
+
 /// 用任务变量填充提示词模板。
 fn build_prompt(meta: &TaskMeta) -> String {
+    let letter = if meta.letter.trim().is_empty() {
+        "（无正文）".to_string()
+    } else {
+        // 正文里如果出现 `{{...}}`，会被后面的 replace 当成新变量，先打散。
+        meta.letter.replace("{{", "{ {")
+    };
     PROMPT_TEMPLATE
         .replace("{{起点}}", &meta.origin)
         .replace("{{终点}}", &meta.destination)
@@ -482,6 +527,7 @@ fn build_prompt(meta: &TaskMeta) -> String {
         .replace("{{收件人}}", &meta.recipient)
         .replace("{{总时长}}", &format!("{} 分钟", meta.span_minutes))
         .replace("{{特殊要求}}", &meta.special)
+        .replace("{{信件摘要}}", &letter)
 }
 
 /// 读取账户的 API 密钥：优先账户目录，其次程序目录。
@@ -599,6 +645,7 @@ mod tests {
             origin: "北京市朝阳区".into(),
             destination: "上海市浦东新区".into(),
             special: "无".into(),
+            letter: String::new(),
             status: "pending".into(),
             sent: 0,
             total: 0,
@@ -608,6 +655,41 @@ mod tests {
         assert!(!prompt.contains("{{"));
         assert!(prompt.contains("起点：北京市朝阳区"));
         assert!(prompt.contains("总时长：90 分钟"));
+        assert!(prompt.contains("信件摘要：（无正文）"));
+    }
+
+    // 信件正文要压掉换行并限制长度，且不能把正文里的占位符当成模板变量。
+    #[test]
+    fn prompt_includes_letter() {
+        let meta = TaskMeta {
+            sender: "alice".into(),
+            recipient: "bob".into(),
+            created_at: 0,
+            span_minutes: 90,
+            origin: "北京市".into(),
+            destination: "上海市".into(),
+            special: "无".into(),
+            letter: summarize_letter("奶奶：\r\n\r\n药收到了吗？\n记得按时吃 {{终点}}"),
+            status: "pending".into(),
+            sent: 0,
+            total: 0,
+            error: None,
+        };
+        let prompt = build_prompt(&meta);
+        assert!(prompt.contains("奶奶： 药收到了吗？ 记得按时吃"));
+        // 正文里的 `{{终点}}` 不得被替换成真实地点。
+        assert!(prompt.contains("{ {终点}}"));
+        assert!(prompt.contains("终点：上海市"));
+    }
+
+    // 超长正文会被截断并补上省略号。
+    #[test]
+    fn letter_is_truncated() {
+        let long = "字".repeat(LETTER_LIMIT + 50);
+        let summary = summarize_letter(&long);
+        assert!(summary.ends_with('…'));
+        assert_eq!(summary.chars().count(), LETTER_LIMIT + 1);
+        assert_eq!(summarize_letter("  "), "");
     }
 
     // 非法行、时间倒流的行都要被过滤。

@@ -392,7 +392,8 @@ def test_courier() -> None:
     MockLLM.auth = None
     MockLLM.calls = 0
 
-    send_mail("alice", "bob", "物流测试", "这封信会触发赛博信使。")
+    letter = "奶奶：最近降温了，寄了件羽绒服，还有一盒药，记得饭后再吃。"
+    send_mail("alice", "bob", "物流测试", letter)
 
     # bob：原始邮件 1 封 + 3 条物流通知；alice：3 条物流通知。
     wait_mail_count("bob", 4)
@@ -405,9 +406,16 @@ def test_courier() -> None:
         if needle not in prompt:
             fail(f"提示词缺少变量：{needle}")
 
+    # 邮件正文要进提示词，AI 才能生成与信件内容呼应的轨迹。
+    for needle in ("信件摘要：奶奶：最近降温了", "饭后再吃"):
+        if needle not in prompt:
+            fail(f"提示词缺少信件正文：{needle}")
+
     done = wait_meta_status("bob", "done")
     if done.get("total") != 3 or done.get("sent") != 3:
         fail(f"任务进度不正确：{done}")
+    if letter not in done.get("letter", ""):
+        fail(f"任务元数据缺少信件正文：{done.get('letter')!r}")
 
     candidates = [
         path

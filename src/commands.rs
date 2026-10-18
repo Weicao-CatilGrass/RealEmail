@@ -87,6 +87,13 @@ pub fn subject_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// 取出邮件正文（已按 MIME 解码到可读文本），供物流任务使用。
+pub fn body_of(raw: &[u8]) -> String {
+    let (headers, body) = split_headers(raw);
+    let text = extract_text(&headers, body);
+    normalize_text(&text)
+}
+
 /// 从邮件的 Content-Type 出发提取可读正文。
 fn extract_text(headers: &[(String, String)], body: &[u8]) -> String {
     extract_text_inner(headers, body, 0)
