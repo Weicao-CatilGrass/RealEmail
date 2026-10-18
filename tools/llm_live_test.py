@@ -37,8 +37,8 @@ WORK.mkdir(parents=True)
 for name in ("alice", "bob"):
     run([str(BIN), "--accounts", str(WORK / "accounts.toml"), "add", name, "-p", "pw123456"])
 
-(WORK / "alice.md").write_text("地址：北京市朝阳区望京街道\n", encoding="utf-8")
-(WORK / "bob.md").write_text("地址：上海市浦东新区张江镇\n", encoding="utf-8")
+(WORK / "alice.md").write_text("地址：黑龙江省哈尔滨市道里区中央大街\n", encoding="utf-8")
+(WORK / "bob.md").write_text("地址：海南省三亚市吉阳区大东海\n", encoding="utf-8")
 (WORK / "bob").mkdir(exist_ok=True)
 (WORK / "bob" / "deepseek-api-key").write_text(KEY, encoding="utf-8")
 
@@ -54,7 +54,7 @@ server = subprocess.Popen(
         "--smtp-port", str(SMTP_PORT),
         "--pop3-port", str(POP3_PORT),
         "--courier-interval-seconds", "5",
-        "--courier-span-minutes", "60",
+        "--courier-span-minutes", "4320",
         "--llm-model", "deepseek-flash",
     ],
     stdout=log,
