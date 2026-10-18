@@ -37,6 +37,24 @@ cargo run -- encrypt 明文密码   # 生成密文，手工填入 accounts.toml
 cargo run -- serve             # 启动服务
 ```
 
+## 赛博信使（物流任务）
+
+本地账户之间投递成功后，会在**收件人目录** `./{收件人}/` 创建：
+
+- `from-{寄件人}-{UTC 时间}.json`：物流轨迹 JSONL，字段固定为
+  `{"date":"YYYY-MM-DD HH:MM","courier-name":"英文名","message":"物流描述"}`；
+- `from-{寄件人}-{UTC 时间}.meta.json`：任务元数据与投递进度（pending/ready/done/failed）。
+
+规则：
+
+- 后台每 60 秒轮询一次（`--courier-interval-seconds`），先调 LLM 生成，再逐条按时间投递；
+- 密钥优先读 `./{收件人}/deepseek-api-key`，其次 `./deepseek-api-key`；
+  没有密钥或调用失败只标记 `failed`，不允许伪造轨迹；
+- 到点的轨迹同时投递到收件人和寄件人邮箱，投递走邮件存储，不再触发新任务；
+- 起终点来自双方 `./{账户}.md` 中的 `地址：` 行，缺省用 `账户@域名`；
+- 发往 `system` 的邮件不创建物流任务；
+- 寄件人不是本地账户时整封邮件忽略（SMTP 仍回 250）。
+
 ## system 账户命令
 
 发往 `system` 账户的邮件按主题执行命令，目前只有一条：
@@ -62,6 +80,7 @@ src/
   pop3.rs      # POP3 取信
   proto.rs     # 行级协议读写工具
   commands.rs  # system 账户的邮件命令与 MIME 解码
+  courier.rs   # 赛博信使物流任务：LLM 生成、轮询、按时间投递
 tools/
   e2e_test.py  # 端到端测试脚本
 ```

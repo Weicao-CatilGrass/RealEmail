@@ -133,6 +133,7 @@ pub fn is_normal_disconnect(message: &str) -> bool {
     message == "idle timeout"
         || message.contains("aborted")
         || message.contains("reset by peer")
+        || message.contains("forcibly closed")
         || message.contains("Broken pipe")
         || message.contains("unexpected end of file")
         || message.contains("connection closed")

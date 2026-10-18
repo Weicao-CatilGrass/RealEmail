@@ -79,6 +79,14 @@ pub async fn handle(workspace: &Path, sender: &str, raw: &[u8]) -> Result<Option
     }
 }
 
+/// 取出邮件主题（已解码 RFC 2047），供物流任务使用。
+pub fn subject_of(raw: &[u8]) -> String {
+    let (headers, _) = split_headers(raw);
+    header(&headers, "subject")
+        .map(decode_rfc2047)
+        .unwrap_or_default()
+}
+
 /// 从邮件的 Content-Type 出发提取可读正文。
 fn extract_text(headers: &[(String, String)], body: &[u8]) -> String {
     extract_text_inner(headers, body, 0)

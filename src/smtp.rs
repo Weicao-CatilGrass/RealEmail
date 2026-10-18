@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::accounts::Accounts;
 use crate::commands::{self, SYSTEM_ACCOUNT};
+use crate::courier::{self, CourierConfig};
 use crate::mailstore::MailStore;
 use crate::proto::{split_command, Conn, MAX_COMMAND_LINE};
 
@@ -27,6 +28,8 @@ pub struct SmtpCtx {
     pub store: MailStore,
     /// system 命令脚本的存放目录（程序所在目录）。
     pub workspace: PathBuf,
+    /// 物流任务配置，投递成功后用于登记赛博信使任务。
+    pub courier: Arc<CourierConfig>,
     /// 单封邮件允许的最大字节数。
     pub max_message: usize,
 }
@@ -191,10 +194,20 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                 counter += 1;
                 let queue_id = format!("{}.{}.{}", unix_seconds(), std::process::id(), counter);
                 let full = build_message(&ctx, helo.as_deref(), &peer, &queue_id, mail_from.as_deref(), &body);
-                // 发件人必须是本地账户，system 命令才能确定写入哪个文件。
+                // 寄件人也必须是本地账户，否则这封信直接忽略（既不投递也不建任务）。
                 let sender_account = mail_from
                     .as_deref()
                     .and_then(|address| local_account(address, &ctx.accounts.map));
+                let Some(sender_account) = sender_account else {
+                    println!(
+                        "[smtp] 寄件人 <{}> 不是服务器账户，忽略该邮件",
+                        mail_from.as_deref().unwrap_or("")
+                    );
+                    conn.write_line("250 2.0.0 Ok: ignored").await?;
+                    mail_from = None;
+                    recipients.clear();
+                    continue;
+                };
 
                 // 内部转发：把同一封邮件投递到所有本地收件人。
                 let mut delivered = 0usize;
@@ -204,9 +217,7 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
                             delivered += 1;
                             println!(
                                 "[smtp] 收到 <{}> 发往 <{}> 的邮件，编号 {}",
-                                mail_from.as_deref().unwrap_or(""),
-                                recipient,
-                                uid
+                                sender_account, recipient, uid
                             );
                         }
                         Err(err) => eprintln!("[smtp] 投递到 `{recipient}` 失败: {err}"),
@@ -215,20 +226,36 @@ async fn handle(ctx: Arc<SmtpCtx>, stream: TcpStream) -> Result<()> {
 
                 // 发往 system 账户的邮件：按主题执行命令（例如设置个人介绍）。
                 if recipients.iter().any(|name| name == SYSTEM_ACCOUNT) {
-                    match sender_account.as_deref() {
-                        Some(sender) if sender != SYSTEM_ACCOUNT => {
-                            match commands::handle(&ctx.workspace, sender, &full).await {
-                                Ok(Some(outcome)) => println!(
-                                    "[system] 执行 `{}`，已写入 {}",
-                                    outcome.command,
-                                    outcome.path.display()
-                                ),
-                                Ok(None) => {}
-                                Err(err) => eprintln!("[system] 命令执行失败: {err}"),
-                            }
+                    if sender_account != SYSTEM_ACCOUNT {
+                        match commands::handle(&ctx.workspace, &sender_account, &full).await {
+                            Ok(Some(outcome)) => println!(
+                                "[system] 执行 `{}`，已写入 {}",
+                                outcome.command,
+                                outcome.path.display()
+                            ),
+                            Ok(None) => {}
+                            Err(err) => eprintln!("[system] 命令执行失败: {err}"),
                         }
-                        Some(_) => eprintln!("[system] 忽略 system 自己发出的命令邮件"),
-                        None => eprintln!("[system] 发件人不是本地账户，忽略命令"),
+                    } else {
+                        eprintln!("[system] 忽略 system 自己发出的命令邮件");
+                    }
+                }
+
+                // 为普通收件人创建物流任务（system 是命令入口，不参与模拟）。
+                let subject = commands::subject_of(&full);
+                for recipient in &recipients {
+                    if recipient == SYSTEM_ACCOUNT || delivered == 0 {
+                        continue;
+                    }
+                    if let Err(err) = courier::create_task(
+                        &ctx.courier,
+                        &sender_account,
+                        recipient,
+                        &subject,
+                    )
+                    .await
+                    {
+                        eprintln!("[courier] 创建任务失败: {err}");
                     }
                 }
 

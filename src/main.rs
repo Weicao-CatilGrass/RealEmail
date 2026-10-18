@@ -8,6 +8,7 @@
 
 mod accounts;
 mod commands;
+mod courier;
 mod crypto;
 mod mailstore;
 mod pop3;
@@ -22,6 +23,7 @@ use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 
 use accounts::Accounts;
+use courier::CourierConfig;
 use crypto::Cipher;
 use mailstore::MailStore;
 
@@ -33,6 +35,14 @@ const DEFAULT_POP3_PORT: u16 = 3628;
 const DEFAULT_DOMAIN: &str = "realemail.local";
 /// 单封邮件默认大小上限（MB）。
 const DEFAULT_MAX_MESSAGE_MB: u64 = 25;
+/// 物流轨迹默认模拟总时长（分钟）。
+const DEFAULT_SPAN_MINUTES: u32 = 180;
+/// 物流任务默认轮询间隔（秒）。
+const DEFAULT_POLL_SECONDS: u64 = 60;
+/// 默认的 LLM 接口地址（DeepSeek，OpenAI 兼容协议）。
+const DEFAULT_LLM_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
+/// 默认的 LLM 模型。
+const DEFAULT_LLM_MODEL: &str = "deepseek-chat";
 
 /// 命令行参数。
 #[derive(Parser, Debug)]
@@ -79,6 +89,18 @@ enum Command {
         /// 单封邮件大小上限（MB）。
         #[arg(long = "max-message-mb", default_value_t = DEFAULT_MAX_MESSAGE_MB)]
         max_message_mb: u64,
+        /// 物流轨迹模拟总时长（分钟）。
+        #[arg(long = "courier-span-minutes", default_value_t = DEFAULT_SPAN_MINUTES)]
+        courier_span_minutes: u32,
+        /// 物流任务轮询间隔（秒）。
+        #[arg(long = "courier-interval-seconds", default_value_t = DEFAULT_POLL_SECONDS)]
+        courier_interval_seconds: u64,
+        /// LLM 接口地址，兼容 OpenAI 的 chat/completions 协议。
+        #[arg(long = "llm-endpoint", default_value = DEFAULT_LLM_ENDPOINT)]
+        llm_endpoint: String,
+        /// LLM 模型名。
+        #[arg(long = "llm-model", default_value = DEFAULT_LLM_MODEL)]
+        llm_model: String,
     },
     /// 新增账户并设置密码。
     Add {
@@ -138,17 +160,25 @@ async fn main() -> Result<()> {
             pop3_port,
             domain,
             max_message_mb,
+            courier_span_minutes,
+            courier_interval_seconds,
+            llm_endpoint,
+            llm_model,
         } => {
-            serve(
-                &accounts_path,
-                &key_path,
+            serve(ServeOptions {
+                accounts_path,
+                key_path,
                 data_dir,
                 host,
                 smtp_port,
                 pop3_port,
                 domain,
                 max_message_mb,
-            )
+                courier_span_minutes,
+                courier_interval_seconds,
+                llm_endpoint,
+                llm_model,
+            })
             .await
         }
         Command::Paths => {
@@ -211,24 +241,49 @@ fn default_serve() -> Command {
         pop3_port: DEFAULT_POP3_PORT,
         domain: DEFAULT_DOMAIN.to_string(),
         max_message_mb: DEFAULT_MAX_MESSAGE_MB,
+        courier_span_minutes: DEFAULT_SPAN_MINUTES,
+        courier_interval_seconds: DEFAULT_POLL_SECONDS,
+        llm_endpoint: DEFAULT_LLM_ENDPOINT.to_string(),
+        llm_model: DEFAULT_LLM_MODEL.to_string(),
     }
 }
 
-/// 启动 SMTP 与 POP3 两个监听器。
-#[allow(clippy::too_many_arguments)]
-async fn serve(
-    accounts_path: &Path,
-    key_path: &Path,
+/// serve 子命令的完整参数集合。
+struct ServeOptions {
+    accounts_path: PathBuf,
+    key_path: PathBuf,
     data_dir: PathBuf,
     host: String,
     smtp_port: u16,
     pop3_port: u16,
     domain: String,
     max_message_mb: u64,
-) -> Result<()> {
-    let cipher = Cipher::load_or_create(key_path)?;
-    let accounts = Arc::new(load_accounts_or_hint(accounts_path, &cipher)?);
-    let workspace = workspace_dir(accounts_path);
+    courier_span_minutes: u32,
+    courier_interval_seconds: u64,
+    llm_endpoint: String,
+    llm_model: String,
+}
+
+/// 启动 SMTP 与 POP3 两个监听器，以及物流任务轮询。
+async fn serve(options: ServeOptions) -> Result<()> {
+    let ServeOptions {
+        accounts_path,
+        key_path,
+        data_dir,
+        host,
+        smtp_port,
+        pop3_port,
+        domain,
+        max_message_mb,
+        courier_span_minutes,
+        courier_interval_seconds,
+        llm_endpoint,
+        llm_model,
+    } = options;
+
+    let cipher = Cipher::load_or_create(&key_path)?;
+    let accounts = Arc::new(load_accounts_or_hint(&accounts_path, &cipher)?);
+    let workspace = workspace_dir(&accounts_path);
 
     let store = MailStore::new(data_dir.clone())?;
     for name in accounts.map.keys() {
@@ -241,11 +296,24 @@ async fn serve(
     println!("脚本目录: {}", workspace.display());
     println!("已加载 {} 个账户", accounts.map.len());
 
+    // 物流任务：后台每分钟扫描一次，生成并投递赛博信使轨迹。
+    let courier_cfg = Arc::new(CourierConfig {
+        workspace: workspace.clone(),
+        domain: domain.clone(),
+        span_minutes: courier_span_minutes,
+        interval: std::time::Duration::from_secs(courier_interval_seconds.max(1)),
+        endpoint: llm_endpoint.clone(),
+        model: llm_model.clone(),
+        store: store.clone(),
+    });
+    tokio::spawn(courier::run(courier_cfg.clone(), accounts.clone()));
+
     let smtp_ctx = Arc::new(smtp::SmtpCtx {
         host: domain.clone(),
         accounts: accounts.clone(),
         store: store.clone(),
         workspace: workspace.clone(),
+        courier: courier_cfg.clone(),
         max_message: (max_message_mb as usize) * 1024 * 1024,
     });
     let pop3_ctx = Arc::new(pop3::Pop3Ctx {
@@ -264,6 +332,12 @@ async fn serve(
 
     println!("SMTP 监听: {host}:{smtp_port}");
     println!("POP3 监听: {host}:{pop3_port}");
+    println!(
+        "物流轮询: 每 {} 秒一次，模拟总时长 {} 分钟，模型 {}",
+        courier_interval_seconds.max(1),
+        courier_span_minutes,
+        llm_model
+    );
     if host != "127.0.0.1" && host != "localhost" {
         println!("提示：服务使用明文协议，未启用 TLS，请只在内网或本机使用");
     }
