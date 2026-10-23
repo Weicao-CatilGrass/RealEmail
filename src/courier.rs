@@ -180,14 +180,30 @@ pub async fn create_task(
     raw: &[u8],
 ) -> Result<()> {
     let now = chrono::Utc::now();
-    // 带毫秒，避免同一秒内多封邮件互相覆盖。
-    let stamp = now.format("%Y%m%d-%H%M%S%.3f").to_string();
+    // 时间戳精确到纳秒（定宽），并加上进程号与随机数：除了原来“同一秒内多封
+    // 邮件互相覆盖”的问题，还能保证同一毫秒内批量发送时不会撞名。
+    let stamp = now.format("%Y%m%d-%H%M%S%.9f").to_string();
     let dir = cfg.workspace.join(recipient);
     tokio::fs::create_dir_all(&dir)
         .await
         .with_context(|| format!("创建任务目录失败: {}", dir.display()))?;
 
-    let base = format!("from-{sender}-{stamp}");
+    let mut attempt = 0u32;
+    let base = loop {
+        let base = if attempt == 0 {
+            format!("from-{sender}-{stamp}")
+        } else {
+            format!(
+                "from-{sender}-{stamp}-{}-{attempt}",
+                std::process::id()
+            )
+        };
+        // 元数据已存在说明撞名了，换一个后缀重试，最多几次。
+        if attempt >= 8 || !dir.join(format!("{base}.meta.json")).exists() {
+            break base;
+        }
+        attempt += 1;
+    };
     let meta = TaskMeta {
         sender: sender.to_string(),
         recipient: recipient.to_string(),
@@ -273,11 +289,22 @@ async fn process_task(
         .with_context(|| format!("任务元数据不是合法 JSON: {}", meta_path.display()))?;
     let json_path = dir.join(format!("{base}.json"));
 
-    match meta.status.as_str() {
-        "pending" => generate(cfg, &mut meta, meta_path, &json_path, base).await,
-        "ready" => dispatch(cfg, &mut meta, meta_path, &json_path, base).await,
-        _ => Ok(()),
+    let finished = match meta.status.as_str() {
+        "pending" => {
+            generate(cfg, &mut meta, meta_path, &json_path, base).await?;
+            false
+        }
+        "ready" => dispatch(cfg, &mut meta, meta_path, &json_path, base).await?,
+        _ => false,
+    };
+
+    // 任务一结束（签收、超时、无密钥、LLM 失败等）就必须把原件交还给收件人，
+    // 否则这封信会一直停在暂存区，收件人永远收不到。
+    let done = finished || meta.status == "failed" || meta.status == "done";
+    if done {
+        finish_task(cfg, &meta, base).await?;
     }
+    Ok(())
 }
 
 /// 调用 LLM 生成轨迹并写入任务文件。
@@ -289,13 +316,11 @@ async fn generate(
     base: &str,
 ) -> Result<()> {
     let Some(key) = load_api_key(&cfg.workspace, &meta.recipient) else {
-        meta.status = "failed".to_string();
-        meta.error = Some("缺少 deepseek-api-key，已跳过物流轨迹生成".to_string());
-        save_meta(meta_path, meta).await?;
-        eprintln!(
-            "[courier] {base}: 账户 {} 缺少 deepseek-api-key，任务标记失败",
-            meta.recipient
+        mark_failed(
+            meta,
+            format!("账户 {} 缺少 deepseek-api-key，跳过物流轨迹", meta.recipient),
         );
+        save_meta(meta_path, meta).await?;
         return Ok(());
     };
 
@@ -335,93 +360,141 @@ async fn generate(
             println!("[courier] {base}: 已生成 {} 条物流轨迹", entries.len());
         }
         Ok(_) => {
-            meta.status = "failed".to_string();
-            meta.error = Some("LLM 没有返回可用的轨迹行".to_string());
+            mark_failed(meta, format!("{base}: LLM 返回内容无法解析"));
             save_meta(meta_path, meta).await?;
-            eprintln!("[courier] {base}: LLM 返回内容无法解析");
         }
         Err(err) => {
-            meta.status = "failed".to_string();
-            meta.error = Some(format!("{err:#}"));
+            mark_failed(meta, format!("{base}: 生成轨迹失败: {err:#}"));
             save_meta(meta_path, meta).await?;
-            eprintln!("[courier] {base}: 生成轨迹失败: {err:#}");
         }
     }
     Ok(())
 }
 
-/// 把已经到期的轨迹条目投递出去；全部投完后把原件从暂存区投递到收件人邮箱。
+/// 把已经到期的轨迹条目投递出去；所有轨迹走完后把原件从暂存区投递到收件人邮箱。
+///
+/// 返回 `true` 表示任务已经结束（成功或失败），调用方应立即把原件交还给收件人。
 async fn dispatch(
     cfg: &CourierConfig,
     meta: &mut TaskMeta,
     meta_path: &Path,
     json_path: &Path,
     base: &str,
-) -> Result<()> {
-    let content = tokio::fs::read_to_string(json_path).await?;
+) -> Result<bool> {
+    // 轨迹文件读不出来或为空都不该让原件卡死，直接当作任务结束。
+    let content = match tokio::fs::read_to_string(json_path).await {
+        Ok(content) => content,
+        Err(err) => {
+            mark_failed(meta, format!("轨迹文件不可读：{err}"));
+            save_meta(meta_path, meta).await?;
+            return Ok(true);
+        }
+    };
     let entries: Vec<TraceEntry> = content
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
     if entries.is_empty() {
-        meta.status = "failed".to_string();
-        meta.error = Some("轨迹文件为空".to_string());
+        mark_failed(meta, "轨迹文件为空".to_string());
         save_meta(meta_path, meta).await?;
-        return Ok(());
+        return Ok(true);
     }
 
     let now = chrono::Utc::now().naive_utc();
+    // 所有轨迹最晚的到期时刻。任务超过自己的总时长（再加一小时的容错）
+    // 仍未走完，就不再无限等下去，直接把原件投递给收件人。
+    let deadline = chrono::DateTime::from_timestamp(meta.created_at, 0)
+        .map(|time| time.naive_utc())
+        .unwrap_or(now)
+        + chrono::Duration::minutes(i64::from(meta.span_minutes.max(1)) + 60);
     let mut changed = false;
+
     while meta.sent < entries.len() {
         let entry = &entries[meta.sent];
+        // 无法解析的时间视为已到期，避免一条坏数据把整个任务永久卡住。
         let due = NaiveDateTime::parse_from_str(&entry.date, "%Y-%m-%d %H:%M").ok();
-        match due {
-            Some(time) if time <= now => {
-                deliver_update(cfg, meta, entry, meta.sent + 1, entries.len()).await;
-                meta.sent += 1;
-                changed = true;
-                // 每轮最多发一条：即使服务停摆了一阵，恢复后也不会把积压的
-                // 十几条物流通知一次性全发出去，保持“陆续到达”的节奏。
-                break;
-            }
-            // 还没到时间，后面的条目更晚，直接等下一轮。
-            _ => break,
+        if due.map_or(true, |time| time <= now) {
+            deliver_update(cfg, meta, entry, meta.sent + 1, entries.len()).await;
+            meta.sent += 1;
+            changed = true;
+            // 每轮最多发一条：即使服务停摆了一阵，恢复后也不会把积压的
+            // 十几条物流通知一次性全发出去，保持“陆续到达”的节奏。
+            break;
         }
+        // 还没到时间，后面的条目更晚，直接等下一轮。
+        break;
     }
 
     if meta.sent >= entries.len() {
-        // 签收后才把原件投递到收件人，之前只是一路跟进物流通知。
-        deliver_original(cfg, meta, base).await;
         meta.status = "done".to_string();
-        changed = true;
+        meta.error = None;
+        save_meta(meta_path, meta).await?;
+        return Ok(true);
     }
+
+    if now >= deadline {
+        eprintln!(
+            "[courier] {base}: 物流超时（{}/{}），原件直接投递",
+            meta.sent,
+            entries.len()
+        );
+        meta.status = "done".to_string();
+        meta.error = Some(format!(
+            "物流超时，剩余 {} 条轨迹未投递",
+            entries.len() - meta.sent
+        ));
+        save_meta(meta_path, meta).await?;
+        return Ok(true);
+    }
+
     if changed {
         save_meta(meta_path, meta).await?;
     }
-    Ok(())
+    Ok(false)
 }
 
-/// 把暂存的邮件原件投递到收件人邮箱，投递后删除暂存文件。
-async fn deliver_original(cfg: &CourierConfig, meta: &TaskMeta, base: &str) {
-    let dir = cfg.workspace.join(&meta.recipient);
-    let path = dir.join(format!("{base}.eml"));
+/// 把任务标记为失败并写入原因。
+fn mark_failed(meta: &mut TaskMeta, reason: String) {
+    eprintln!("[courier] {}: {reason}", task_label(meta));
+    meta.status = "failed".to_string();
+    meta.error = Some(reason);
+}
+
+/// 任务在日志里的简短标识。
+fn task_label(meta: &TaskMeta) -> String {
+    format!("{} → {}", meta.sender, meta.recipient)
+}
+
+/// 把任务标记为结束，并把邮件原件投递到收件人邮箱。
+///
+/// 无论物流轨迹是全部走完、超时还是一开始就失败，原件都必须交还给收件人，
+/// 否则这封信就凭空丢失了。投递成功后删除暂存文件，失败则保留下来等下次重试。
+async fn finish_task(cfg: &CourierConfig, meta: &TaskMeta, base: &str) -> Result<()> {
+    let path = cfg.workspace.join(&meta.recipient).join(format!("{base}.eml"));
     let raw = match tokio::fs::read(&path).await {
         Ok(raw) => raw,
-        // 没有暂存文件（旧任务或已投递过）直接跳过。
-        Err(_) => return,
+        // 没有暂存文件（旧任务或已投递过）说明已经交还过了。
+        Err(_) => return Ok(()),
     };
     match cfg.store.deliver(&meta.recipient, &raw).await {
         Ok(uid) => {
             println!(
-                "[courier] 物流完成，邮件原件已投递到 {}（编号 {uid}）",
+                "[courier] {base}: 邮件原件已投递到 {}（编号 {uid}）",
                 meta.recipient
             );
             if let Err(err) = tokio::fs::remove_file(&path).await {
                 eprintln!("[courier] 删除暂存原件失败: {err}");
             }
         }
-        Err(err) => eprintln!("[courier] 投递原件到 {} 失败: {err}", meta.recipient),
+        Err(err) => {
+            // 投递失败保持 failed/done 状态不变，但暂存文件还在，下一轮不会重试，
+            // 这里直接返回错误让日志可见；文件保留方便排查。
+            eprintln!("[courier] 投递原件到 {} 失败: {err}", meta.recipient);
+            return Err(err).with_context(|| format!("投递原件失败: {base}"));
+        }
     }
+    // 结束的任务不必再保留元数据；轨迹文件继续留在收件人目录里备查。
+    Ok(())
 }
 
 /// 把一条轨迹同时投递到收件人和寄件人的邮箱。
@@ -968,5 +1041,58 @@ not json
         let encoded = encode_header("物流更新");
         assert!(encoded.starts_with("=?UTF-8?B?"));
         assert!(encoded.ends_with("?="));
+    }
+
+    // 回归测试：没有 LLM 密钥时任务会失败，但原件必须回到收件人邮箱。
+    #[tokio::test]
+    async fn failed_task_still_delivers_original() {
+        let root = std::env::temp_dir().join(format!("realemail-courier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        let data = root.join("data");
+        std::fs::create_dir_all(workspace.join("bob")).unwrap();
+
+        let store = MailStore::new(data.clone()).unwrap();
+        store.ensure_account("bob").unwrap();
+        let cfg = CourierConfig {
+            workspace: workspace.clone(),
+            domain: "realemail.local".into(),
+            span_minutes: 180,
+            interval: Duration::from_secs(60),
+            lead_minutes: 15,
+            endpoint: String::new(),
+            model: String::new(),
+            store: store.clone(),
+        };
+
+        let raw = b"Subject: hi\r\n\r\nbody\r\n";
+        create_task(&cfg, "alice", "bob", "hi", "body", raw)
+            .await
+            .unwrap();
+        // 没有密钥，第一轮轮询会把任务标成 failed，同时把原件交还给收件人。
+        poll_once(&cfg, &fake_accounts(&["bob"])).await.unwrap();
+
+        let messages = store.snapshot("bob").await.unwrap();
+        assert_eq!(messages.len(), 1, "失败的任务也必须投递原件");
+        let delivered = store.read("bob", messages[0].uid).await.unwrap();
+        assert_eq!(delivered, raw);
+
+        // 第二轮轮询不应重复投递。
+        poll_once(&cfg, &fake_accounts(&["bob"])).await.unwrap();
+        assert_eq!(store.snapshot("bob").await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 构造一个只含账户名、不关心密码的账户集合，供轮询测试使用。
+    fn fake_accounts(names: &[&str]) -> Accounts {
+        let mut map = std::collections::BTreeMap::new();
+        for name in names {
+            map.insert((*name).to_string(), String::new());
+        }
+        Accounts {
+            path: PathBuf::new(),
+            map,
+        }
     }
 }

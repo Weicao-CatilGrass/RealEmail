@@ -49,9 +49,21 @@ PASSWORDS = {
 # 服务端会强制首条不早于 lead-minutes、相邻至少 5 分钟；
 # 测试里把轮询间隔和首条延迟都调小（各 1 分钟），以便很快拿到结果。
 MOCK_TRACE = [
-    {"courier-name": "Michael Smith", "message": "快件已揽收，运单号 SF1234567890", "offset": 1},
-    {"courier-name": "Anna Brown", "message": "到达上海转运中心，进入分拣环节", "offset": 6},
-    {"courier-name": "Tom Wilson", "message": "已签收，签收凭证已上传，追踪码关闭", "offset": 11},
+    {
+        "courier-name": "Michael Smith",
+        "message": "快件已揽收，运单号 SF1234567890",
+        "offset": 1,
+    },
+    {
+        "courier-name": "Anna Brown",
+        "message": "到达上海转运中心，进入分拣环节",
+        "offset": 6,
+    },
+    {
+        "courier-name": "Tom Wilson",
+        "message": "已签收，签收凭证已上传，追踪码关闭",
+        "offset": 11,
+    },
 ]
 
 
@@ -282,13 +294,14 @@ def test_reject_remote_recipient() -> None:
 def test_local_delivery() -> None:
     """alice 发给 bob 的邮件应创建物流任务，但原件要等签收后才投递。"""
     send_mail("alice", "bob", "第一封测试邮件", "你好 bob，这是正文。\n第二行。")
-    # 此时还没有 deepseek-api-key，任务必须被标记为失败而不是伪造轨迹。
+    # 此时还没有 deepseek-api-key，任务必须被标记为失败而不是伪造轨迹；
+    # 但失败不等于丢信，原件仍要交还给收件人。
     meta = wait_meta_status("bob", "failed")
     if "deepseek-api-key" not in (meta.get("error") or ""):
         fail(f"失败原因不正确：{meta.get('error')}")
-    if mail_count("bob") != 0:
-        fail("物流未完成前不应投递原件")
-    print("通过：本地投递创建任务，无密钥时标记失败且不投递原件")
+    if not wait_mail_count_ok("bob", 1, timeout=30):
+        fail(f"物流失败后没有收到原件：{mail_count('bob')} 封")
+    print("通过：本地投递创建任务，无密钥时标记失败并仍然投递原件")
 
 
 def test_pop3() -> None:
@@ -319,7 +332,9 @@ def test_pop3() -> None:
 
     raw = b"\r\n".join(client.retr(1)[1])
     message = email.message_from_bytes(raw)
-    subject = str(email.header.make_header(email.header.decode_header(message["Subject"])))
+    subject = str(
+        email.header.make_header(email.header.decode_header(message["Subject"]))
+    )
     if subject != "设置个人介绍":
         fail(f"RETR 取回的主题不正确：{subject!r}")
     body = message.get_payload(decode=True).decode("utf-8", "replace")
@@ -390,15 +405,22 @@ def test_external_sender_ignored() -> None:
         code, _ = client.rcpt(f"bob@{DOMAIN}")
         if code != 250:
             fail(f"RCPT 应返回 250，实际 {code}")
-        code, text = client.data(build_message("stranger", "bob", "外部来信", "不应被投递"))
+        code, text = client.data(
+            build_message("stranger", "bob", "外部来信", "不应被投递")
+        )
         if code != 250:
             fail(f"DATA 应返回 250，实际 {code} {text}")
 
     time.sleep(1.5)
-    if mail_count("bob") != 0:
-        fail("非本地发件人的邮件不应投递")
-    # 前面 test_local_delivery 留下的失败任务不算数，这里只确认没有新的暂存原件。
-    pending = [p for p in (WORK / "bob").glob("from-*.eml") if "外部来信" in p.read_bytes().decode("utf-8", "replace")]
+    # 前面 test_local_delivery 的那封原件已经当场交还（1 封），这里只确认没有新增。
+    if mail_count("bob") != 1:
+        fail(f"非本地发件人的邮件不应投递：bob 邮箱有 {mail_count('bob')} 封")
+    # 只确认没有新的暂存原件。
+    pending = [
+        p
+        for p in (WORK / "bob").glob("from-*.eml")
+        if "外部来信" in p.read_bytes().decode("utf-8", "replace")
+    ]
     if pending:
         fail("非本地发件人的邮件不应创建物流任务")
     print("通过：非本地发件人的邮件被忽略")
@@ -419,12 +441,13 @@ def test_courier() -> None:
     # bob：先收 3 条物流通知，签收后再收 1 封邮件原件；alice：3 条物流通知。
     # 服务端强制相邻轨迹至少 5 分钟，三条要等 10 分钟出头。
     print("等待物流轨迹按节奏投递（约 12 分钟）...")
-    wait_mail_count("bob", 3, timeout=900)
+    # 前面测试已在 bob 邮箱留下 1 封原件，所以在 4 封之前不应再增加。
+    wait_mail_count("bob", 4, timeout=900)
     wait_mail_count("alice", 3, timeout=900)
 
-    # 签收前收件人不应拿到原件。
+    # 签收前收件人不应拿到第二封原件。
     before = mail_count("bob")
-    if before != 3:
+    if before != 4:
         fail(f"签收前 bob 就收到了原件：{before} 封")
 
     if MockLLM.auth != "Bearer test-key":
@@ -462,7 +485,11 @@ def test_courier() -> None:
     ]
     matched = None
     for path in candidates:
-        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        lines = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
         if len(lines) == 3:
             matched = (path, lines)
             break
@@ -479,11 +506,13 @@ def test_courier() -> None:
         fail("轨迹时间必须严格递增")
 
     # 确认投递出去的物流通知能被正常解析（主题是 RFC 2047 编码）。
-    # 此时原件尚未到达，bob 邮箱里只有 3 封物流通知。
+    # 此时原件尚未到达，bob 邮箱里的物流通知应当正好 3 封。
     updates = []
     for mail_path in sorted((WORK / "data" / "bob").glob("*.eml")):
         message = email.message_from_bytes(mail_path.read_bytes())
-        subject = str(email.header.make_header(email.header.decode_header(message["Subject"])))
+        subject = str(
+            email.header.make_header(email.header.decode_header(message["Subject"]))
+        )
         if subject.startswith("物流更新"):
             body = message.get_payload(decode=True).decode("utf-8", "replace")
             updates.append((subject, body))
@@ -494,9 +523,8 @@ def test_courier() -> None:
             fail(f"物流通知正文不完整：{body!r}")
         if "物流更新" not in subject:
             fail(f"物流通知主题不正确：{subject!r}")
-
     # 签收后原件应已投递，暂存文件被清理。
-    if not wait_mail_count_ok("bob", 4, timeout=30):
+    if not wait_mail_count_ok("bob", 5, timeout=30):
         fail(f"签收后没有收到原件：{mail_count('bob')} 封")
     if list((WORK / "bob").glob("*.eml")):
         fail("签收后暂存原件没有被清理")
@@ -505,7 +533,9 @@ def test_courier() -> None:
     originals = []
     for mail_path in sorted((WORK / "data" / "bob").glob("*.eml")):
         message = email.message_from_bytes(mail_path.read_bytes())
-        subject = str(email.header.make_header(email.header.decode_header(message["Subject"])))
+        subject = str(
+            email.header.make_header(email.header.decode_header(message["Subject"]))
+        )
         if subject == "物流测试":
             originals.append(message)
     if len(originals) != 1:
